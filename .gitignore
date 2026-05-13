@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
+
+# Data (don't commit raw data)
+data/
+
+# Env
+ml_env/
+.conda/
+
+# IDE
+.vscode/
+.idea/
+
+# Superpowers
+.superpowers/
