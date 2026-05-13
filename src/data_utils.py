@@ -1,7 +1,7 @@
 """Load, validate, and preprocess data."""
 import pandas as pd
 import numpy as np
-from src.config import TRAIN_PATH, TEST_SIMPLE_PATH, TEST_COMPLEX_PATH, FEATURE_COLS
+from config import TRAIN_PATH, TEST_SIMPLE_PATH, TEST_COMPLEX_PATH, FEATURE_COLS
 
 
 def load_train():

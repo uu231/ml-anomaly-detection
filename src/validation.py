@@ -1,17 +1,15 @@
-"""Purged Block CV and two-phase FPR validation."""
+"""Purged Block CV and two-phase FPR validation, plus robust thresholding."""
 import numpy as np
 from sklearn.metrics import (
     average_precision_score, f1_score, recall_score,
     precision_score, confusion_matrix,
 )
-from src.data_utils import get_anomaly_clusters
+from data_utils import get_anomaly_clusters
 
 
 def purged_block_cv_splits(y):
-    """Create Purged Block CV splits based on anomaly clusters.
-
-    Each fold leaves out one anomaly cluster as validation.
-    """
+    """Create Purged Block CV splits based on anomaly clusters."""
+    # ... 原代码完全不变 ...
     clusters = get_anomaly_clusters(y)
     n = len(y)
     anomaly_start = int(np.where(y.values == 1)[0][0])
@@ -72,21 +70,57 @@ def two_phase_fpr(model, X_normal, n_windows=4):
     return np.mean(fprs), np.std(fprs)
 
 
-def find_best_threshold(y_true, y_prob, metric="f1"):
-    """Grid search for best decision threshold."""
-    thresholds = np.arange(0.01, 1.0, 0.01)
-    best_thresh = 0.5
+# ================= 新增：基于正常分布的阈值 =================
+def threshold_from_normal_distribution(y_prob_normal, target_fpr=0.001):
+    """
+    根据正常样本的异常分数分布确定阈值。
+    y_prob_normal: 仅包含正常样本的预测概率（或异常分数）
+    target_fpr: 目标误报率
+    """
+    y_prob_normal = np.array(y_prob_normal)
+    if len(y_prob_normal) == 0:
+        return 0.5
+    # 使用分位数：例如 1 - target_fpr 分位点作为阈值
+    threshold = np.quantile(y_prob_normal, 1 - target_fpr)
+    return float(threshold)
+
+
+def find_best_threshold_robust(y_true, y_prob, y_prob_normal_only=None,
+                               target_fpr=0.001, metric="f1"):
+    """
+    组合策略：先用正常分布找一个基准阈值（满足 target_fpr），
+    然后在附近搜索提升验证集 F1/recall 的阈值（但不会让 FPR 超过 target_fpr*2）。
+    """
+    if y_prob_normal_only is not None and len(y_prob_normal_only) > 0:
+        base_thresh = threshold_from_normal_distribution(y_prob_normal_only, target_fpr)
+    else:
+        base_thresh = 0.5
+
+    # 搜索范围：base_thresh 的 ±0.2，但限制在 [0.01, 0.99]
+    lower = max(0.01, base_thresh - 0.2)
+    upper = min(0.99, base_thresh + 0.2)
+    thresholds = np.linspace(lower, upper, 50)
+    best_thresh = base_thresh
     best_score = -1
 
     for t in thresholds:
         y_pred = (y_prob >= t).astype(int)
+        cm = confusion_matrix(y_true, y_pred)
+        if cm.size == 4:
+            tn, fp, fn, tp = cm.ravel()
+            fpr = fp / (fp + tn) if (fp+tn) > 0 else 0
+        else:
+            fpr = 0
+        # 允许的 FPR 上限为目标值的 2 倍，且最小为 0.002
+        max_fpr_allowed = max(target_fpr * 2, 0.002)
+        if fpr > max_fpr_allowed:
+            continue
         if metric == "f1":
             score = f1_score(y_true, y_pred, zero_division=0)
         elif metric == "recall":
             score = recall_score(y_true, y_pred, zero_division=0)
         elif metric == "precision":
             score = precision_score(y_true, y_pred, zero_division=0)
-
         if score > best_score:
             best_score = score
             best_thresh = t
