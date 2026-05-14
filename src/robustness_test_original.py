@@ -1,7 +1,7 @@
 """
 train_robust_full.py
 使用 MAD + 预测误差(Huber) + 训练增强 + QuantileTransformer + 鲁棒阈值，
-对 train.csv 的前 85% 训练，后 15% 验证，并评估 11 个偏移变体。
+对 train.csv 的前 85% 训练，后 15% 验证，并评估 11 个偏移变体（并行加速）。
 """
 
 import os
@@ -17,6 +17,7 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 from lightgbm import LGBMClassifier, early_stopping as lgb_es
+from joblib import Parallel, delayed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -36,7 +37,6 @@ def augment_normal_samples(X, y, noise_std=0.25, scale_range=0.4, offset_range=1
     """对正常样本施加逐样本扰动 + 概率性全局偏移"""
     rng = np.random.RandomState(seed)
     X_aug = X.copy()
-    n_samples = len(X)
 
     mask_normal = y == 0
     idx_normal = np.where(mask_normal)[0]
@@ -72,7 +72,7 @@ def compute_all_metrics(y_true, y_prob, threshold=0.5):
     return {"AUC-PR": auc_pr, "F1": f1, "Recall": rec, "Precision": prec, "FPR": fpr}
 
 
-# ===================== 偏移变体 =====================
+# ===================== 偏移变体生成 =====================
 def get_feature_cols(df):
     return [col for col in df.columns if col.startswith("f") and col[1:].isdigit()]
 
@@ -104,6 +104,19 @@ VARIANTS = {
 }
 
 
+# 评估单个变体的函数（用于并行）
+def evaluate_variant(name, params, train_df, predictors, scaler, model, threshold, variants_dir):
+    df_var = apply_scale_offset_noise(train_df, **params, seed=SEED)
+    df_var.to_csv(os.path.join(variants_dir, f"train_{name}.csv"), index=False)
+
+    X_var, _, _ = build_features(df_var, show_progress=False, trained_predictors=predictors)
+    X_var_s = scaler.transform(X_var)
+    y_true = df_var["y"].values
+    y_prob = model.predict_proba(X_var_s)[:, 1]
+    metrics = compute_all_metrics(y_true, y_prob, threshold)
+    return name, metrics
+
+
 # ===================== 主流程 =====================
 def main():
     # 1. 加载数据与特征
@@ -126,7 +139,7 @@ def main():
 
     # 3. QuantileTransformer（映射到正态分布）
     scaler = QuantileTransformer(
-        n_quantiles=min(1000, len(X_train_raw)),  # 分位数个数，不超过样本数
+        n_quantiles=min(1000, len(X_train_raw)),
         output_distribution='normal',
         random_state=SEED
     )
@@ -197,22 +210,18 @@ def main():
     joblib.dump(pipeline, os.path.join(MODEL_DIR, "robust_pipeline.pkl"))
     print("Pipeline saved.")
 
-    # 9. 生成偏移变体并评估
-    print("\nGenerating shifted variants...")
+    # 9. 并行生成偏移变体并评估（限制并行度避免 OOM）
+    print("\nEvaluating shifted variants in parallel (n_jobs=2)...")
     variants_dir = "data/shifted_variants"
     os.makedirs(variants_dir, exist_ok=True)
+
+    results = Parallel(n_jobs=4)(
+        delayed(evaluate_variant)(name, params, train_df, predictors, scaler, model, best_thresh, variants_dir)
+        for name, params in VARIANTS.items()
+    )
+
     all_results = {"original_val": metrics_original}
-
-    for name, params in VARIANTS.items():
-        df_var = apply_scale_offset_noise(train_df, **params, seed=SEED)
-        df_var.to_csv(os.path.join(variants_dir, f"train_{name}.csv"), index=False)
-
-        # 变体特征构建 + 同样使用训练好的 scaler 变换
-        X_var, _, _ = build_features(df_var, show_progress=False, trained_predictors=predictors)
-        X_var_s = scaler.transform(X_var)
-        y_true = df_var["y"].values
-        y_prob = model.predict_proba(X_var_s)[:, 1]
-        metrics = compute_all_metrics(y_true, y_prob, best_thresh)
+    for name, metrics in results:
         all_results[name] = metrics
         print(f"  {name}: F1={metrics['F1']:.4f}, FPR={metrics['FPR']:.4f}")
 
