@@ -1,9 +1,10 @@
-"""Temporal feature engineering pipeline with robust & prediction-error features."""
+"""Temporal feature engineering pipeline with robust & prediction-error features (Huber) + frequency stats."""
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import HuberRegressor
 from numpy.lib.stride_tricks import sliding_window_view
+from scipy.signal import periodogram
 
 from config import (
     FEATURE_COLS, LAGS, DIFFS_1, DIFFS_2,
@@ -12,7 +13,7 @@ from config import (
     MAD_WINDOWS, PREDICTOR_LAGS, PREDICTOR_TRAIN_PROP, SEED,
 )
 
-# 基础特征总步数
+# 基础特征总步数（不含频域和预测误差）
 TOTAL_BASE_STEPS = (
     1                                      # raw features
     + len(LAGS)                           # lag
@@ -25,36 +26,27 @@ TOTAL_BASE_STEPS = (
     + len(EMA_SPANS)                                 # EMA
 )
 
+# 频域特征步数（每个特征3个统计量）
+FREQ_STEPS = len(FEATURE_COLS)
 
 def build_features(df, show_progress=True, y_series=None, trained_predictors=None):
-    """Build temporal features + prediction error features from raw DataFrame.
-
-    Args:
-        df: input DataFrame with FEATURE_COLS
-        show_progress: show tqdm progress
-        y_series: (optional) labels for training predictors; if None, skip prediction features
-        trained_predictors: (optional) pre-trained dict of predictors per feature
-    Returns:
-        X: feature matrix (numpy array)
-        feature_names: list of column names
-        predictors: dict of trained predictors (only if y_series is provided)
-    """
+    """Build temporal + frequency + prediction error features (Huber)."""
     X = df[FEATURE_COLS].copy()
     X = X.ffill().fillna(0)
 
     feature_parts = [X.values]
     feature_names = list(X.columns)
 
-    # ---------- 进度条总步数 ----------
+    # 计算总步数
     extra_steps = 0
     if y_series is not None or trained_predictors is not None:
-        extra_steps = 1 + len(FEATURE_COLS) * 2   # 训练/推理 1步 + madz 33步 + errstd 33步
-    total_steps = TOTAL_BASE_STEPS + extra_steps
+        extra_steps = 1 + len(FEATURE_COLS) * 2   # 预测误差 + madz + errstd
+    total_steps = TOTAL_BASE_STEPS + FREQ_STEPS + extra_steps
 
     pbar = tqdm(total=total_steps, desc="  Building features", disable=not show_progress,
                 bar_format="{desc}: {n}/{total} |{bar} | {elapsed}")
 
-    # ================= 基础特征 =================
+    # ================= 1. 基础时域特征 =================
     # Lag features
     for lag in LAGS:
         lagged = X.shift(lag).ffill()
@@ -134,17 +126,18 @@ def build_features(df, show_progress=True, y_series=None, trained_predictors=Non
         feature_names.extend(ema.columns)
         pbar.update(1)
 
-    # ================= 预测误差特征 =================
+    # ================= 2. 频域特征（在 QuantileTransformer 之前计算） =================
+    _add_frequency_features(X, feature_parts, feature_names, pbar)
+
+    # ================= 3. 预测误差特征（Huber回归） =================
     predictors = None
     if trained_predictors is not None:
-        # 推理模式
         pred_error_feats, pred_error_names = _compute_pred_errors_inference(
             X, trained_predictors, pbar
         )
         feature_parts.append(pred_error_feats)
         feature_names.extend(pred_error_names)
     elif y_series is not None:
-        # 训练模式
         predictors, pred_error_feats, pred_error_names = _train_and_compute_pred_errors(
             X, y_series, pbar
         )
@@ -156,53 +149,82 @@ def build_features(df, show_progress=True, y_series=None, trained_predictors=Non
     return X_result, feature_names, predictors
 
 
-# ======================== 向量化工具 ========================
+def _add_frequency_features(X, feat_parts, feat_names, pbar):
+    """
+    对每个特征，每隔 step 点计算一次周期图，提取均值、标准差、谱熵，
+    并前向填充到整个窗口，完全避免未来信息泄露。
+    """
+    step = 50          # 滑动步长
+    window = 64        # 周期图窗口
+    n_samples = X.shape[0]
+    stats_labels = ["freq_mean", "freq_std", "freq_entropy"]
+
+    for col in X.columns:
+        signal = X[col].values
+        # 用于存放三个统计量
+        freq_stats = np.zeros((n_samples, len(stats_labels)))
+
+        # 滑动计算
+        for i in range(0, n_samples - window + 1, step):
+            seg = signal[i:i+window]
+            f, pxx = periodogram(seg, detrend='constant')
+            pxx = pxx + 1e-12  # 避免 log(0)
+            pxx_norm = pxx / np.sum(pxx)
+
+            freq_stats[i:i+window, 0] = np.mean(pxx)       # 平均功率
+            freq_stats[i:i+window, 1] = np.std(pxx)        # 功率标准差
+            freq_stats[i:i+window, 2] = -np.sum(pxx_norm * np.log(pxx_norm))  # 谱熵
+        # 填充末尾不足一个窗口的部分
+        last_start = (n_samples // step) * step
+        if last_start < n_samples:
+            seg = signal[last_start:]
+            if len(seg) >= 4:   # 周期图至少需要4个点
+                f, pxx = periodogram(seg, detrend='constant')
+                pxx = pxx + 1e-12
+                pxx_norm = pxx / np.sum(pxx)
+                freq_stats[last_start:, 0] = np.mean(pxx)
+                freq_stats[last_start:, 1] = np.std(pxx)
+                freq_stats[last_start:, 2] = -np.sum(pxx_norm * np.log(pxx_norm))
+            else:
+                freq_stats[last_start:, :] = freq_stats[last_start-1, :]  # 复制前一个
+
+        feat_parts.append(freq_stats)
+        feat_names += [f"{col}_{stat}" for stat in stats_labels]
+        pbar.update(1)
+
+
+# ======================== 向量化预测工具 ========================
 def _compute_errors_vectorized(series, lags, model):
-    """用滑动窗口批量预测，返回与 series 等长的误差数组。"""
     max_lag = max(lags)
     n = len(series)
     if n <= max_lag:
         return np.zeros(n)
 
-    # 窗口大小为 max_lag+1，这样每个窗口的最后一个是当前值
     windowed = sliding_window_view(series, window_shape=max_lag + 1)
-    # windowed[t] = [series[t], series[t+1], ..., series[t+max_lag]]
-    # 我们只能预测 t = max_lag ... n-1，对应的窗口索引为 0 ... n-max_lag-1
-    windowed = windowed[:n - max_lag]   # 形状 (n - max_lag, max_lag + 1)
-
-    # 滞后特征：取每个窗口的前 max_lag 列，然后逆序
-    lagged = windowed[:, :max_lag]          # (n-max_lag, max_lag)
-    lagged = lagged[:, ::-1]                # 逆序，现在第0列为series[t+max_lag-1]，第max_lag-1列为series[t]
-    # 选取指定的滞后阶数 (lag -> 索引 lag-1)
+    windowed = windowed[:n - max_lag]
+    lagged = windowed[:, :max_lag][:, ::-1]
     X_pred = lagged[:, [lag - 1 for lag in lags]]
-
-    # 批量预测
-    preds = model.predict(X_pred)          # 长度 n - max_lag
+    preds = model.predict(X_pred)
     errors = np.zeros(n)
     errors[max_lag:] = series[max_lag:] - preds
     return errors
 
 
 def _make_ar_dataset(series, lags):
-    """为训练预测模型创建滞后数据集。"""
     max_lag = max(lags)
     n = len(series)
     if n <= max_lag:
         return np.array([]).reshape(-1, 0), np.array([])
 
     windowed = sliding_window_view(series, window_shape=max_lag + 1)
-    # 形状 (n - max_lag, max_lag + 1)
-    X = windowed[:, :max_lag]                # 滞后特征
-    y = windowed[:, max_lag]                 # 当前值
-    # 逆序并选择指定滞后
-    X = X[:, ::-1]                            # 逆序
-    X = X[:, [lag - 1 for lag in lags]]      # 选列
+    X = windowed[:, :max_lag]
+    y = windowed[:, max_lag]
+    X = X[:, ::-1]
+    X = X[:, [lag - 1 for lag in lags]]
     return X, y
 
 
-# ======================== 训练预测器并生成误差 ========================
 def _train_and_compute_pred_errors(X, y_series, pbar):
-    """在正常数据上训练AR预测器，并计算整个序列的预测误差特征。"""
     normal_mask = (y_series.values == 0)
     if normal_mask.sum() < 50:
         raise ValueError("Not enough normal samples to train predictors.")
@@ -215,7 +237,6 @@ def _train_and_compute_pred_errors(X, y_series, pbar):
     predictors = {}
     all_errors = np.zeros((len(X), len(FEATURE_COLS)))
 
-    # 对每个特征训练 AR 模型并计算误差
     for i, col in enumerate(FEATURE_COLS):
         series = X[col].values
         train_series = X_normal_train[col].values
@@ -227,21 +248,19 @@ def _train_and_compute_pred_errors(X, y_series, pbar):
             predictors[col] = ("mean", mean_val)
             continue
 
-        model = LinearRegression()
+        model = HuberRegressor(epsilon=1.35, max_iter=500)
         model.fit(X_ar, y_ar)
         predictors[col] = model
 
-        # 向量化计算整个序列的误差
         all_errors[:, i] = _compute_errors_vectorized(series, PREDICTOR_LAGS, model)
 
     pbar.update(1)
 
-    # 构造误差特征 DataFrame
     error_df = pd.DataFrame(all_errors, columns=[f"{c}_pred_error" for c in FEATURE_COLS])
     error_feats = [error_df.values]
     error_names = list(error_df.columns)
 
-    # 误差的滚动 MAD z‑score (窗口20)
+    # 误差 MAD z-score (窗口20)
     for col in error_df.columns:
         s = error_df[col]
         roll_median = s.rolling(window=20, min_periods=1).median().bfill()
@@ -253,7 +272,7 @@ def _train_and_compute_pred_errors(X, y_series, pbar):
         error_names.append(f"{col}_madz20")
         pbar.update(1)
 
-    # 误差的滚动标准差 (窗口20)
+    # 误差滚动标准差 (窗口20)
     for col in error_df.columns:
         roll_std = error_df[col].rolling(window=20, min_periods=1).std().bfill()
         error_feats.append(roll_std.values.reshape(-1, 1))
@@ -263,9 +282,7 @@ def _train_and_compute_pred_errors(X, y_series, pbar):
     return predictors, np.hstack(error_feats), error_names
 
 
-# ======================== 推理模式 ========================
 def _compute_pred_errors_inference(X, trained_predictors, pbar):
-    """用已保存的 predictors 计算预测误差特征（推理时使用）。"""
     all_errors = np.zeros((len(X), len(FEATURE_COLS)))
     for i, col in enumerate(FEATURE_COLS):
         series = X[col].values
@@ -282,7 +299,6 @@ def _compute_pred_errors_inference(X, trained_predictors, pbar):
     error_feats = [error_df.values]
     error_names = list(error_df.columns)
 
-    # 误差 MAD z‑score
     for col in error_df.columns:
         s = error_df[col]
         roll_median = s.rolling(window=20, min_periods=1).median().bfill()
@@ -294,7 +310,6 @@ def _compute_pred_errors_inference(X, trained_predictors, pbar):
         error_names.append(f"{col}_madz20")
         pbar.update(1)
 
-    # 误差滚动标准差
     for col in error_df.columns:
         roll_std = error_df[col].rolling(window=20, min_periods=1).std().bfill()
         error_feats.append(roll_std.values.reshape(-1, 1))

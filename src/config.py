@@ -27,6 +27,13 @@ ROLLING_MINMAX_WINDOWS = [5, 10, 20]
 ZSCORE_WINDOWS = [10, 20, 50]          # 保留但将在特征构建时用 MAD 版替代
 EMA_SPANS = [5, 10, 20]
 
+
+# 频域特征配置
+STFT_WINDOW_SIZE = 32          # STFT 窗口长度（2的幂）
+STFT_STEP = 16                 # 步长
+STFT_TOP_FREQS = 5             # 保留能量最高的前5个频率分量
+STFT_STATS = ["mean", "std"]   # 对频谱幅值的统计
+
 # ----------------- 新增：稳健特征与预测误差 -----------------
 MAD_WINDOWS = [10, 20, 50]              # MAD (中位数绝对偏差) 窗口
 PREDICTOR_LAGS = [1, 2, 3, 5]          # 预测模型使用的滞后阶数（AR 模型）
