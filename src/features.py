@@ -29,6 +29,18 @@ TOTAL_BASE_STEPS = (
 # 频域特征步数（每个特征3个统计量）
 FREQ_STEPS = len(FEATURE_COLS)
 
+
+def get_feature_count(with_predictors=True):
+    """Return approximate number of engineered features."""
+    n_time = (1 + len(LAGS) + len(DIFFS_1) + len(DIFFS_2)
+              + len(ROLLING_WINDOWS) * len(ROLLING_STATS)
+              + len(ROLLING_MINMAX_WINDOWS) * 2
+              + len(ZSCORE_WINDOWS) + len(MAD_WINDOWS)
+              + len(EMA_SPANS)) * len(FEATURE_COLS)
+    n_freq = len(FEATURE_COLS) * 3
+    n_pred = len(FEATURE_COLS) * 3 if with_predictors else 0
+    return n_time + n_freq + n_pred
+
 def build_features(df, show_progress=True, y_series=None, trained_predictors=None):
     """Build temporal + frequency + prediction error features (Huber)."""
     X = df[FEATURE_COLS].copy()

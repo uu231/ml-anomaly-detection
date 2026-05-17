@@ -34,7 +34,7 @@ print("  - config & data utils loaded", flush=True)
 from src.features import build_features, get_feature_count
 print("  - feature engineering loaded", flush=True)
 
-from src.validation import find_best_threshold, compute_metrics
+from src.validation import find_best_threshold_robust, compute_metrics
 print("  - validation loaded", flush=True)
 
 # Heavy imports (lightgbm, xgboost)
@@ -95,7 +95,7 @@ def mode_train():
     print(f"  Z-score:       w=10,20,50")
     print(f"  EMA:           span=5,10,20")
     print(f"  Target: ~{get_feature_count()} features")
-    X, feat_names = build_features(df)
+    X, feat_names, _ = build_features(df)
     y = df["y"].values
     print(f"  Built: {X.shape[1]} features x {X.shape[0]:,} samples")
     print(f"  Memory: {X.nbytes / 1024**2:.0f} MB")
@@ -140,22 +140,19 @@ def mode_train():
     _stamp("STEP 4/5 — Training final model on ALL data", t0)
     print(f"  Using best model: LightGBM")
     print(f"  Training on full train.csv ({len(df):,} rows)")
-    model, scaler, feat_names_out = train_final_model(build_features, df)
+    model, scaler, best_thresh, feat_names_out, predictors = train_final_model(df)
 
-    # Threshold tuning
-    print(f"\n  Tuning decision threshold...")
-    X_all, _ = build_features(df)
+    # Rebuild features on full data with trained predictors for metrics display
+    print(f"\n  Computing full-data metrics...")
+    X_all, _, _ = build_features(df, trained_predictors=predictors)
     X_all_s = scaler.transform(X_all)
     y_prob_all = model.predict_proba(X_all_s)[:, 1]
 
     anomaly_start = int(np.where(df["y"].values == 1)[0][0])
     print(f"  Anomaly region: [{anomaly_start}, {len(y)}) = {len(y)-anomaly_start} samples")
-    best_thresh, best_f1 = find_best_threshold(
-        y[anomaly_start:], y_prob_all[anomaly_start:], metric="f1"
-    )
 
     metrics = compute_metrics(y[anomaly_start:], y_prob_all[anomaly_start:], best_thresh)
-    print(f"  Best threshold: {best_thresh:.2f} (maximizes F1)")
+    print(f"  Best threshold: {best_thresh:.4f} (from train_final_model)")
     print(f"  ┌──────────┬────────┐")
     print(f"  │ Metric   │ Value  │")
     print(f"  ├──────────┼────────┤")
@@ -178,7 +175,7 @@ def mode_train():
     # ── 5. Save ──────────────────────────────────────────────
     _stamp("STEP 5/5 — Saving pipeline", t0)
     model_path = os.path.join(MODEL_DIR, "model.pkl")
-    save_pipeline(model, scaler, best_thresh, feat_names_out,
+    save_pipeline(model, scaler, best_thresh, feat_names_out, predictors,
                   {"lgbm_params": LGBM_PARAMS}, model_path)
 
     _stamp("TRAINING COMPLETE", t0)
@@ -205,14 +202,17 @@ def mode_predict():
     model = pipeline["model"]
     scaler = pipeline["scaler"]
     threshold = pipeline["threshold"]
+    predictors = pipeline.get("predictors", None)
     print(f"  Model: LightGBM ({model.best_iteration_} trees)")
     print(f"  Threshold: {threshold:.3f} (fixed — same for both tasks)")
+    if predictors is not None:
+        print(f"  Predictors: {len(predictors)} AR models loaded")
 
     # Task 1
     _stamp("Task 1 — Predicting test_simple.csv (similar distribution)", t0)
     test_s = load_test_simple()
     print(f"  Loading: {len(test_s):,} rows x {len(FEATURE_COLS)} features")
-    X_s, _ = build_features(test_s)
+    X_s, _, _ = build_features(test_s, trained_predictors=predictors)
     X_s_s = scaler.transform(X_s)
     y_pred_s = (model.predict_proba(X_s_s)[:, 1] >= threshold).astype(int)
     n_pos_s = y_pred_s.sum()
@@ -230,7 +230,7 @@ def mode_predict():
     print(f"  NOTE: Using SAME model, SAME threshold as Task 1 — no retraining!")
     test_c = load_test_complex()
     print(f"  Loading: {len(test_c):,} rows x {len(FEATURE_COLS)} features")
-    X_c, _ = build_features(test_c)
+    X_c, _, _ = build_features(test_c, trained_predictors=predictors)
     X_c_s = scaler.transform(X_c)
     y_pred_c = (model.predict_proba(X_c_s)[:, 1] >= threshold).astype(int)
     n_pos_c = y_pred_c.sum()

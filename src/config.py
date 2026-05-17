@@ -47,9 +47,6 @@ N_FOLDS = 4
 FPR_WINDOWS = 4
 TARGET_FPR = 0.005                     # 正常数据上允许的最大误报率（目标）
 THRESHOLD_SEARCH_METRIC = "f1"         # 最终仍以验证 F1 进行微调
-# 预测误差相关（已在 features.py 中）
-PREDICTOR_LAGS = [1, 2, 3, 5]
-PREDICTOR_TRAIN_PROP = 0.6
 # 训练增强的默认参数（可在训练脚本中覆盖）
 AUG_NOISE_STD = 0.08
 AUG_SCALE_RANGE = 0.03
